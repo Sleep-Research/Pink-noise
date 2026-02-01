@@ -692,7 +692,7 @@
                         await this.audioContext.resume();
                     }
                     
-                    this.createPinkNoise();
+                    await this.createPinkNoise();
                     this.updateVolume(this.volumeSlider.value);
                     
                     this.isPlaying = true;
@@ -713,30 +713,123 @@
                 }
             }
 
-            createPinkNoise() {
-                // 創建Pink Noise - 使用audio元素以支援iOS背景播放
+            async createPinkNoise() {
+                // 目標：讓 iOS 在背景/螢幕鎖定/瀏覽器節流時仍能持續產生噪音
+                // 作法：優先使用 AudioWorklet（在音訊執行緒產生粉紅噪音），再透過 MediaStreamDestination → audio 元素播放
                 const bufferSize = 4096;
-                
-                // 創建audio元素用於iOS背景播放
+
+                // 建立/重建 audio 元素（用於 iOS 的 media 播放路徑）
+                if (this.audioElement) {
+                    try {
+                        this.audioElement.pause();
+                        this.audioElement.srcObject = null;
+                        document.body.removeChild(this.audioElement);
+                    } catch (e) {}
+                    this.audioElement = null;
+                }
+
                 this.audioElement = document.createElement('audio');
                 this.audioElement.style.display = 'none';
                 this.audioElement.controls = false;
                 this.audioElement.autoplay = false;
                 this.audioElement.loop = false;
                 this.audioElement.preload = 'auto';
+                this.audioElement.playsInline = true; // iOS
                 document.body.appendChild(this.audioElement);
-                
-                // 創建粉紅噪音
+
+                // 建立增益節點與 MediaStreamDestination
+                this.gainNode = this.audioContext.createGain();
+                const destination = this.audioContext.createMediaStreamDestination();
+
+                // 優先用 AudioWorklet 產生 pink noise（更不容易被 iOS 節流/中斷）
+                const canWorklet = !!(this.audioContext.audioWorklet && window.AudioWorkletNode);
+
+                if (canWorklet) {
+                    const workletCode = `
+                        class PinkNoiseProcessor extends AudioWorkletProcessor {
+                            constructor() {
+                                super();
+                                this.b0 = 0; this.b1 = 0; this.b2 = 0; this.b3 = 0; this.b4 = 0; this.b5 = 0; this.b6 = 0;
+                            }
+                            process(inputs, outputs) {
+                                const output = outputs[0][0];
+                                let b0 = this.b0, b1 = this.b1, b2 = this.b2, b3 = this.b3, b4 = this.b4, b5 = this.b5, b6 = this.b6;
+
+                                for (let i = 0; i < output.length; i++) {
+                                    const white = Math.random() * 2 - 1;
+
+                                    // Pink noise filter (Paul Kellet's method)
+                                    b0 = 0.99886 * b0 + white * 0.0555179;
+                                    b1 = 0.99332 * b1 + white * 0.0750759;
+                                    b2 = 0.96900 * b2 + white * 0.1538520;
+                                    b3 = 0.86650 * b3 + white * 0.3104856;
+                                    b4 = 0.55000 * b4 + white * 0.5329522;
+                                    b5 = -0.7616 * b5 - white * 0.0168980;
+
+                                    output[i] = b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362;
+                                    output[i] *= 0.11; // 調整音量
+                                    b6 = white * 0.115926;
+                                }
+
+                                this.b0 = b0; this.b1 = b1; this.b2 = b2; this.b3 = b3; this.b4 = b4; this.b5 = b5; this.b6 = b6;
+                                return true;
+                            }
+                        }
+                        registerProcessor('pink-noise-processor', PinkNoiseProcessor);
+                    `;
+                    const blob = new Blob([workletCode], { type: 'application/javascript' });
+                    const url = URL.createObjectURL(blob);
+
+                    try {
+                        await this.audioContext.audioWorklet.addModule(url);
+                        URL.revokeObjectURL(url);
+
+                        this.noiseNode = new AudioWorkletNode(this.audioContext, 'pink-noise-processor', {
+                            numberOfInputs: 0,
+                            numberOfOutputs: 1,
+                            outputChannelCount: [1]
+                        });
+
+                        // 連接：noise → gain → MediaStreamDestination（給 audio element）
+                        this.noiseNode.connect(this.gainNode);
+                        this.gainNode.connect(destination);
+                    } catch (error) {
+                        console.error('AudioWorklet 建立失敗，回退到 ScriptProcessor:', error);
+                        try { URL.revokeObjectURL(url); } catch (e) {}
+                        this.createPinkNoiseWithScriptProcessor(bufferSize, destination);
+                    }
+                } else {
+                    // 不支援 AudioWorklet 的環境，回退到 ScriptProcessor
+                    this.createPinkNoiseWithScriptProcessor(bufferSize, destination);
+                }
+
+                // 將 MediaStream 設為 audio 元素的源
+                this.audioElement.srcObject = destination.stream;
+
+                // iOS 有時候會在背景暫停 AudioContext / media element：定期嘗試喚醒（成本低）
+                this.ensureIOSPlaybackStaysAlive();
+
+                // 播放 audio
+                this.audioElement.play().then(() => {
+                    console.log('Audio 播放成功');
+                }).catch(error => {
+                    console.error('Audio播放失敗:', error);
+                    // 如果 audio 播放失敗，回退到原始方法（直接連到 destination）
+                    this.fallbackToOriginalMethod();
+                });
+            }
+
+            createPinkNoiseWithScriptProcessor(bufferSize, destination) {
                 this.noiseNode = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
-                
+
                 let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
-                
+
                 this.noiseNode.onaudioprocess = (e) => {
                     const output = e.outputBuffer.getChannelData(0);
-                    
+
                     for (let i = 0; i < bufferSize; i++) {
                         const white = Math.random() * 2 - 1;
-                        
+
                         // Pink noise filter (Paul Kellet's method)
                         b0 = 0.99886 * b0 + white * 0.0555179;
                         b1 = 0.99332 * b1 + white * 0.0750759;
@@ -744,32 +837,46 @@
                         b3 = 0.86650 * b3 + white * 0.3104856;
                         b4 = 0.55000 * b4 + white * 0.5329522;
                         b5 = -0.7616 * b5 - white * 0.0168980;
-                        
+
                         output[i] = b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362;
                         output[i] *= 0.11; // 調整音量
                         b6 = white * 0.115926;
                     }
                 };
-                
-                // 創建增益節點和MediaStreamDestination
-                this.gainNode = this.audioContext.createGain();
-                const destination = this.audioContext.createMediaStreamDestination();
-                
-                // 連接音頻節點
+
+                // 連接：noise → gain → MediaStreamDestination（給 audio element）
                 this.noiseNode.connect(this.gainNode);
                 this.gainNode.connect(destination);
-                
-                // 將MediaStream設為audio元素的源
-                this.audioElement.srcObject = destination.stream;
-                
-                // 播放audio
-                this.audioElement.play().then(() => {
-                    console.log('Audio 播放成功');
-                }).catch(error => {
-                    console.error('Audio播放失敗:', error);
-                    // 如果audio播放失敗，回退到原始方法
-                    this.fallbackToOriginalMethod();
-                });
+            }
+
+            ensureIOSPlaybackStaysAlive() {
+                // 避免重複綁定
+                if (this._iosKeepAliveBound) return;
+                this._iosKeepAliveBound = true;
+
+                const tryResume = async () => {
+                    if (!this.isPlaying) return;
+
+                    try {
+                        if (this.audioContext && this.audioContext.state === 'suspended') {
+                            await this.audioContext.resume();
+                        }
+                    } catch (e) {}
+
+                    try {
+                        if (this.audioElement && this.audioElement.paused) {
+                            await this.audioElement.play();
+                        }
+                    } catch (e) {}
+                };
+
+                // 切換前景/背景時嘗試喚醒
+                document.addEventListener('visibilitychange', tryResume);
+                window.addEventListener('pageshow', tryResume);
+                window.addEventListener('focus', tryResume);
+
+                // iOS 有時在長時間後會進入 suspend：每 20 秒輕量檢查一次
+                this._iosKeepAliveTimer = setInterval(tryResume, 20000);
             }
 
             fallbackToOriginalMethod() {
@@ -795,9 +902,18 @@
             }
 
             startTimer() {
+                // 使用實際時間差而非單純累加，避免 iOS 背景節流導致計時漂移
                 this.timer = setInterval(() => {
-                    this.currentTime++;
+                    if (!this.isPlaying) return;
+
+                    const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+                    this.currentTime = Math.min(this.totalDuration, elapsed);
                     this.updateDisplay();
+
+                    // 以計時器作為保險：即使 setTimeout 被節流也能準時停止
+                    if (this.currentTime >= this.totalDuration) {
+                        this.stopPlaying(true);
+                    }
                 }, 1000);
             }
 
@@ -848,6 +964,11 @@
                 if (this.endTimer) {
                     clearTimeout(this.endTimer);
                     this.endTimer = null;
+                }
+
+                if (this._iosKeepAliveTimer) {
+                    clearInterval(this._iosKeepAliveTimer);
+                    this._iosKeepAliveTimer = null;
                 }
                 
                 this.playBtn.classList.remove('disabled');
